@@ -1,0 +1,80 @@
+name: GPU Simulator
+
+# Optional, non-required check. The hosted runners have no GPU, so this builds
+# the CUDA test binary and runs it on a simulated NVIDIA H100
+# (https://github.com/pantheongpu/pantheonsim). A simulator cannot reproduce
+# hardware-specific behavior or timing, so it complements real-GPU testing and
+# does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "native/**"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cuda-tests:
+    name: CUDA tests (CUDA 13.0 and simulated H100)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      # Only blst is needed (its headers); the goldilocks submodule is only
+      # used by the AVX builds, which this job does not enable.
+      - name: Fetch the blst submodule
+        run: git submodule update --init --depth 1 native/depends/blst
+
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@deff5781e8adfd83dec98dd5242dcbc96a564773 # v0.1.10
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+
+      - name: Install gtest
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtest-dev
+
+      # 90-virtual embeds PTX only, which the simulator runs. The simulator
+      # needs a shared CUDA runtime.
+      - name: Configure
+        working-directory: native
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCUDA_ARCH=90-virtual \
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \
+            -DBUILD_TESTS=ON
+
+      - name: Build
+        working-directory: native
+        run: cmake --build build --target tests.exe -j3
+
+      # The tests print CUDA errors instead of failing on them, so the log is
+      # checked as well: the job fails on a simulator error, a missing device,
+      # a skipped test or an unexpectedly low test count.
+      - name: Test
+        working-directory: native
+        run: |
+          set -o pipefail
+          vgpu run ./build/tests.exe 2>&1 | tee test.log
+          if grep -E "VirtualGPU error|CUDA error|no CUDA-capable device|SKIPPED" test.log; then
+            echo "::error::simulator or device problem in the test log"
+            exit 1
+          fi
+          grep -E "^\[  PASSED  \] [0-9]+ tests?\." test.log
+          n=$(grep -cE "^\[       OK \]" test.log)
+          echo "tests passed: $n"
+          test "$n" -ge 11
